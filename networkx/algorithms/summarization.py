@@ -559,3 +559,637 @@ def snap_aggregation(
         supernode_attribute,
         superedge_attribute,
     )
+
+
+def ksnap_neighbor_info(
+    G,
+    groups,
+    edge_attributes,
+    edge_types,
+    group_lookup,
+    neighbor_info=None,
+    updated_groups=None,
+):
+    """
+    Determines if a group is eligible to be split.
+    A group is eligible to be split if all nodes in the group have edges of the same type(s)
+    with the same other groups.
+    Parameters
+    ----------
+    G: graph
+        graph to be summarized
+    groups: dict
+        A dictionary of unique group IDs and their corresponding node groups
+    group_lookup: dict
+        dictionary of nodes and their current corresponding group ID
+    edge_types: dict
+        dictionary of edges in the graph and their corresponding attributes recognized
+        in the summarization
+    Returns
+    -------
+    tuple: group ID to split, and neighbor-groups participation_counts data structure
+    """
+    participation_counts = {gid: {ogid: Counter() for ogid in groups} for gid in groups}
+    if not neighbor_info:
+        neighbor_info = {
+            node: {gid: Counter() for gid in groups} for node in group_lookup
+        }
+
+    if updated_groups:
+        groups_to_update = updated_groups
+    else:
+        groups_to_update = groups
+
+    for group_id in groups_to_update:
+        current_group = groups[group_id]
+
+        # build neighbor_info for nodes in group
+        for node in current_group:
+            neighbor_info[node] = {group_id: Counter() for group_id in groups}
+            edges = G.edges(node, keys=True) if G.is_multigraph() else G.edges(node)
+            for edge in edges:
+                neighbor = edge[1]
+                edge_type = edge_types[edge]
+                neighbor_group_id = group_lookup[neighbor]
+                neighbor_info[node][neighbor_group_id][edge_type] += 1
+
+        # check if group_id is eligible to be split
+        for other_group_id in groups_to_update:
+            edge_counts = Counter()
+            for node in current_group:
+                edge_counts.update(neighbor_info[node][other_group_id].keys())
+                participation_counts[group_id][other_group_id].update(
+                    neighbor_info[node][other_group_id].keys()
+                )
+
+    # if no eligible groups, complete neighbor_info is calculated
+    return neighbor_info, participation_counts
+
+
+def ksnap_participation_ratio(
+    groups, participation_counts, group_i, group_j, edge_type
+):
+    """
+    The proportion of nodes in both groups that have edges with the other
+    group of a with a given edge type
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes
+    participation_counts: dict
+        indicates the number of nodes in a group that have edges connecting
+        to another group with a given edge type
+    group_i: int
+    group_j: int
+    edge_type: int
+    Returns
+    -------
+    float
+    """
+    numerator = (
+        participation_counts[group_i][group_j][edge_type]
+        + participation_counts[group_j][group_i][edge_type]
+    )
+    denominator = len(groups[group_i]) + len(groups[group_j])
+    return numerator / float(denominator)
+
+
+def ksnap_update_groups(
+    groups,
+    edge_attributes,
+    old_group_id,
+    new_group,
+    group_lookup,
+):
+    """
+    Updates data structures in SNAP aggregation
+    Used in the SNAP aggregation algorithm to update the group id, group sets, and
+    group_lookup after a group has been split.
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes
+    edge_attributes: iterable
+        The edge attributes that can be found in edges in the graph, and
+        are to be recognized in the summarization
+    old_group_id: int
+        the ID of the group that was last split
+    new_groups: iterable
+        List of sets of new groups of nodes
+    group_lookup: dict
+        Dictionary containing the group assignment of each node in the graph
+    Returns
+    -------
+    2-tuple:
+        updated group_ids
+        updated_groups
+    """
+    old_group_count = len(groups)
+
+    groups[old_group_id] -= set(new_group)
+    new_group_id = len(groups)
+    groups[new_group_id] = new_group
+
+    new_total_group_count = old_group_count + 1
+    updated_groups = set([old_group_id]) | set(
+        range(old_group_count, new_total_group_count)
+    )
+    for group_id in updated_groups:
+        for node in groups[group_id]:
+            group_lookup[node] = group_id
+    return groups, new_group_id
+
+
+def ksnaptd_aggregation(
+    G,
+    k,
+    node_attributes,
+    edge_attributes=(),
+    prefix="Supernode-",
+    supernode_attribute="group",
+    superedge_attribute="types",
+):
+    """
+    Executes the KSNAP Top-down summarization algorithm.  Stops when k
+    supernodes exist in the summary graph.
+
+    Parameters
+    ----------
+    G: graph
+        The networkx.Graph to summarize
+    k: int
+        The number of nodes to produce in the summary graph
+    edge_attributes: iterable, optional
+        The edge attributes that can be found in edges in the graph, and
+        are to be recognized in the summarization.  If provided, unique
+        combinations of the attribute values found in the graph are used to
+        determine the edge types in the graph.  If not provided, all edges
+        are considered to be of the same type
+    prefix: str
+        The prefix used to denote supernodes in the summary graph
+
+    Returns
+    -------
+    tuple:
+        networkx.Graph: The summary graph with k supernodes
+        supernodes (dict<string>:<set>): Mappings of the supernodes to
+            the original graph nodes
+    Raises
+    ------
+    ValueError: k must be an integer >= 2
+
+    Examples
+    --------
+    >>> G = nx.karate_club_graph()
+    >>> summarizer = KSNAPTD.from_graph(G, node_attributes=('club', ))
+    >>> smaller_summary_graph, larger_supernodes = summarizer.summarize(G, k=5)
+    >>> larger_summary_graph, smaller_supernodes = summarizer.summarize(G, k=8)
+
+    Notes
+    -----
+    The Top-Down approach is generally more efficient and produces
+    significantly better quality summaries than the bottom-up approach for
+    small values of k.  According to [1]_, when a small k is used, fewer
+    split decisions need to be made to obtain the desired k from the
+    initial A-compatible grouping.  Split decisions are made based on the
+    grouping produced by the previous split decision.  When many splits
+    need to occur to reach the target k groups, split decision errors can
+    accrue to signficantly impact the summary quality.  Minimizing the
+    number of split decisions is generally desireable, as it tends to
+    increase the summary quality.
+    In practice, users are more likely to choose small values of k to
+    generate summaries, making the top-down approach used more often.
+    The Top-down approach first groups nodes by their node attributes.
+    Then, groups are split iteratively until k groups exist.  On each
+    iteration, the split will be chosen on the current grouping to both
+    result in fewer overall discrepancies in edges in the grouping
+    and separate the fewest nodes from the existing group.
+
+    References
+    ----------
+    .. [1] Y. Tian, R. A. Hankins, and J. M. Patel. Efficient aggregation
+       for graph summarization. In Proc. 2008 ACM-SIGMOD Int. Conf.
+       Management of Data (SIGMOD’08), pages 567–580, Vancouver, Canada,
+       June 2008.
+    """
+    if not edge_attributes:
+        edge_attributes = set()
+    edge_types = {
+        edge: tuple(attrs.get(attr) for attr in edge_attributes)
+        for edge, attrs in G.edges.items()
+    }
+    if not G.is_directed():
+        if G.is_multigraph():
+            # list is needed to avoid mutating while iterating
+            edges = [((v, u, k), etype) for (u, v, k), etype in edge_types.items()]
+        else:
+            # list is needed to avoid mutating while iterating
+            edges = [((v, u), etype) for (u, v), etype in edge_types.items()]
+        edge_types.update(edges)
+
+    group_lookup = {
+        node: tuple(attrs[attr] for attr in node_attributes)
+        for node, attrs in G.nodes.items()
+    }
+    groups = defaultdict(set)
+    for node, node_type in group_lookup.items():
+        groups[node_type].add(node)
+
+    neighbor_info, participation_counts = ksnap_neighbor_info(
+        G,
+        groups,
+        edge_attributes,
+        edge_types,
+        group_lookup,
+    )
+
+    while len(groups) < k:
+        group_i, group_t, edge_type = ksnaptd_identify_split(
+            groups, participation_counts, edge_types
+        )
+        new_group = set(
+            node for node in groups[group_i] if neighbor_info[node][group_t][edge_type]
+        )
+        groups, new_group_id = ksnap_update_groups(
+            groups,
+            edge_attributes,
+            group_i,
+            new_group,
+            group_lookup,
+        )
+
+        updated_groups = set([group_i, group_t, new_group_id])
+        for node in groups[group_i]:
+            updated_groups |= set(neighbor_info[node].keys())
+        for node in groups[group_t]:
+            updated_groups |= set(neighbor_info[node].keys())
+
+        neighbor_info, participation_counts = ksnap_neighbor_info(
+            G,
+            groups,
+            edge_attributes,
+            edge_types,
+            group_lookup=group_lookup,
+            neighbor_info=neighbor_info,
+            updated_groups=updated_groups,
+        )
+    return snap_build_graph(
+        G,
+        groups,
+        node_attributes,
+        edge_attributes,
+        neighbor_info,
+        edge_types,
+        prefix,
+        supernode_attribute,
+        superedge_attribute,
+    )
+
+
+def ksnaptd_identify_split(groups, participation_counts, edge_types):
+    """
+    Identifies and returns the group ID to be split
+
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes
+    participation_counts: dict
+        indicates the number of nodes in a group that have edges connecting
+        to another group with a given edge type
+    edge_types: dict
+        A edge key mapping the edge edge values to it's
+        index/ID
+    Returns
+    -------
+    tuple:
+        3-tuple of the group to split, and the neighbor group and
+        edge index by which to split the group
+    """
+    max_group = max_neighbor_group = max_edge_type = 0
+    max_ar_delta = float("-inf")
+    for group_id in groups:
+        for other_group_id in groups:
+            for edge_type in participation_counts[group_id][other_group_id]:
+                participation_ratio = ksnap_participation_ratio(
+                    groups, participation_counts, group_id, other_group_id, edge_type
+                )
+                ar_delta = participation_counts[group_id][other_group_id][edge_type]
+
+                if participation_ratio > 0.5:
+                    ar_delta = len(groups[group_id]) - ar_delta
+
+                if ar_delta > max_ar_delta:
+                    max_ar_delta = ar_delta
+                    max_group = group_id
+                    max_neighbor_group = other_group_id
+                    max_edge_type = edge_type
+
+    return max_group, max_neighbor_group, max_edge_type
+
+
+def ksnapbu_aggregation(
+    G,
+    k,
+    node_attributes,
+    edge_attributes=(),
+    prefix="Supernode-",
+    supernode_attribute="group",
+    superedge_attribute="types",
+):
+    """
+    Executes the Bottom-up summarization algorithm.  Stops when k
+    supernodes exist in the summary graph.
+
+    Parameters
+    ----------
+    G: graph
+        The networkx.Graph to summarize
+    k: int
+        The number of nodes to produce in the summary graph
+    edge_attributes: iterable, optional
+        The edge attributes that can be found in edges in the graph, and
+        are to be recognized in the summarization.  If provided, unique
+        combinations of the attribute values found in the graph are used to
+        determine the edge types in the graph.  If not provided, all edges
+        are considered to be of the same type
+    prefix: str
+        The prefix used to denote supernodes in the summary graph
+
+    Returns
+    -------
+    tuple:
+        networkx.Graph:  The summary graph with k supernodes
+
+    Raises
+    ------
+    ValueError: K must be an integer 2 <= k <= len(AR-Compatible grouping of G)
+
+    Examples
+    --------
+    >>> G = nx.karate_club_graph()
+    >>> node_attributes=('club', )
+    >>> smaller_summary_graph = ksnapbu_aggregation(G, k=10, node_attributes=node_attributes)
+    >>> larger_summary_graph = ksnapbu_aggregation(G, k=14, node_attributes=node_attributes)
+
+    Notes
+    -----
+    The bottom-up approach starts with the AR-compatible groups, which,
+    according to [1]_, gives it an advantage over the top down approach
+    when producing summary graphs with larger values of k as fewer merges
+    need to be made than if the top-down approach were used.  Since each
+    merge decision is made on the current grouping, merge decision errors
+    can compound and result in more decisions being based on those errors
+    when many merges have to occur to obtain the desired k groups.
+    Minimizing the number of merge decisions is generally desireable, as
+    it tends to increase the summary quality.
+    As low k values tend to be used more often, the bottom-up approach is
+    used less often.
+    The Bottom-up approach first executes the SNAP algorithm to produce a
+    Attribute-edge compatible (AR-compatible) grouping.
+    Then, groups are merged iteratively until k groups exist.  On each
+    iteration, the 2 groups with the most similar neighbor groups and
+    participation ratios within those groups are merged into 1 group.  If
+    a group has multiple groups with the same participation ratios,
+    the smaller group is preferred.
+
+    References
+    ----------
+    .. [1] Y. Tian, R. A. Hankins, and J. M. Patel. Efficient aggregation
+       for graph summarization. In Proc. 2008 ACM-SIGMOD Int. Conf.
+       Management of Data (SIGMOD’08), pages 567–580, Vancouver, Canada,
+       June 2008.
+    """
+    if k < 2 or not isinstance(k, int):
+        raise ValueError("k(%r) must be an integer >= 2" % k)
+
+    (
+        groups,
+        neighbor_info,
+        group_lookup,
+        edge_types,
+    ) = snap_build_data_structures(G, node_attributes, edge_attributes)
+
+    if k > len(groups):
+        raise ValueError(
+            "k (%r) must be an integer <= the number of group in a maximal AR-compatible grouping (%r)"
+            % (k, len(groups))
+        )
+
+    neighbor_info, participation_counts = ksnap_neighbor_info(
+        G, groups, edge_attributes, edge_types, group_lookup
+    )
+
+    node_attribute_groups = dict()
+    for group_id in groups:
+        node = next(iter(groups[group_id]))
+        node_attribute_values = tuple(
+            [G.nodes[node][attribute] for attribute in node_attributes]
+        )
+        node_attribute_groups.setdefault(node_attribute_values, set())
+        node_attribute_groups[node_attribute_values].add(group_id)
+
+    is_directed = G.is_directed()
+
+    while len(groups) > k:
+        group_i, group_j = ksnapbu_identify_groups(
+            G,
+            node_attributes,
+            groups,
+            participation_counts,
+            node_attribute_groups,
+            is_directed,
+        )
+        groups, group_lookup = ksnapbu_merge(
+            groups, group_i, group_j, neighbor_info, group_lookup
+        )
+
+        neighbor_info, participation_counts = ksnap_neighbor_info(
+            G, groups, edge_attributes, edge_types, group_lookup
+        )
+
+    return snap_build_graph(
+        G,
+        groups,
+        node_attributes,
+        edge_attributes,
+        neighbor_info,
+        edge_types,
+        prefix,
+        supernode_attribute,
+        superedge_attribute,
+    )
+
+
+def ksnapbu_merge(groups, group_i, group_j, neighbor_info, group_lookup):
+    """
+    Merges group j into group i. updates groups
+
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes
+    group_i (int):
+        ID of group to be merged with group j
+    group_j (int):
+        ID of group to be merged with group i
+    group_lookup: dict
+        dictionary of nodes and their current group ID
+    """
+    for node in groups[group_j]:
+        group_lookup[node] = group_i
+        neighbor_info[node][group_i].update(neighbor_info[node][group_j].keys())
+        neighbor_info[node].pop(group_j)
+
+    groups[group_i] |= groups[group_j]
+    groups.pop(group_j)
+    return groups, group_lookup
+
+
+def ksnapbu_merge_distance(groups, participation_counts, group_i, group_j):
+    """
+    The accumulated differences in participation ratios between groups i
+    and j with other groups.
+
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes in the current graph summary
+    participation_counts: dict
+        indicates the number of nodes in a group that have edges connecting
+        to another group with a given edge type
+    group_i (int):
+        ID of group
+    group_j (int):
+        ID of group
+
+    Returns
+    -------
+    int
+    """
+    output = 0.0
+    for group_id in groups:
+        if group_id in (group_i, group_j):
+            continue
+        for edge_type in participation_counts[group_id][group_i]:
+            output += abs(
+                ksnap_participation_ratio(
+                    groups, participation_counts, group_i, group_id, edge_type
+                )
+                - ksnap_participation_ratio(
+                    groups, participation_counts, group_j, group_id, edge_type
+                )
+            )
+    return output
+
+
+def ksnapbu_agreements(groups, participation_counts, group_i, group_j):
+    """
+    Indicates the total number of mutual neighbors with which groups i and
+    j both have strong/weak edges.
+
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes in the current graph summary
+    participation_counts: dict
+        indicates the number of nodes in a group that have edges connecting
+        to another group with a given edge type
+    group_i (int):
+        ID of group
+    group_j (int):
+        ID of group
+
+    Returns
+    -------
+    int
+    """
+    neighbor_groups_i = set()
+    neighbor_groups_j = set()
+    for group_id in groups:
+        if any(participation_counts[group_i][group_id]):
+            neighbor_groups_i.add(group_id)
+        if any(participation_counts[group_j][group_id]):
+            neighbor_groups_j.add(group_id)
+
+    mutual_neighbors = neighbor_groups_i & neighbor_groups_j
+    agreements = 0
+    for neighbor in mutual_neighbors:
+        for edge_type in participation_counts[group_i][group_j]:
+            participation_ratio_ikr = (
+                ksnap_participation_ratio(
+                    groups, participation_counts, group_i, neighbor, edge_type
+                )
+                <= 0.5
+            )
+            participation_ratio_jkr = (
+                ksnap_participation_ratio(
+                    groups, participation_counts, group_j, neighbor, edge_type
+                )
+                <= 0.5
+            )
+            if not participation_ratio_ikr ^ participation_ratio_jkr:
+                agreements += 1
+
+    return agreements, mutual_neighbors
+
+
+def ksnapbu_identify_groups(
+    G, node_attributes, groups, participation_counts, node_attribute_groups, is_directed
+):
+    """
+    Identifies the optimal groups to merge together based on the groups'
+    similarity in participation ratios with other groups
+
+    Parameters
+    ----------
+    groups: iterable
+        Group membership of nodes in the current graph summary
+    participation_counts: dict
+        indicates the number of nodes in a group that have edges connecting
+        to another group with a given edge type
+    group_i (int):
+        ID of group
+    group_j (int):
+        ID of group
+    is_directed: boolean
+        indicates if the graph is directed
+
+    Returns
+    -------
+    tuple:
+        The 2-tuple of groups to be merged together
+    """
+    potential_groups = dict()
+    for node_attribute_group in node_attribute_groups:
+        attribute_groups = list(node_attribute_groups[node_attribute_group])
+        attribute_group_count = len(attribute_groups)
+        for i in range(attribute_group_count):
+            group_id = attribute_groups[i]
+            group_size = len(groups[group_id])
+            if is_directed:
+                other_group_iterator = range(attribute_group_count)
+            else:
+                other_group_iterator = range(i + 1, attribute_group_count)
+            for j in other_group_iterator:
+                if i == j:
+                    continue
+                other_group_id = attribute_groups[j]
+                args = (group_id, other_group_id)
+                merge_dist = ksnapbu_merge_distance(groups, participation_counts, *args)
+                agreements, mutual_neighbors = ksnapbu_agreements(
+                    groups, participation_counts, group_id, other_group_id
+                )
+                # invert agreements to ensure groups with more agreements are selected first
+                inv_agreements = len(mutual_neighbors) - agreements
+                min_group_size = min(group_size, len(groups[other_group_id]))
+                potential_groups[group_id, other_group_id, node_attribute_group] = (
+                    merge_dist,
+                    inv_agreements,
+                    min_group_size,
+                )
+    group_i, group_j, node_attribute_group = min(
+        potential_groups, key=potential_groups.get
+    )
+    node_attribute_groups[node_attribute_group].discard(group_j)
+    return group_i, group_j

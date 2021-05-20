@@ -643,3 +643,27 @@ class TestSNAPDirectedMulti(AbstractSNAP):
         }
         nx.set_node_attributes(G, supernodes, "group")
         return G
+
+
+class TestKSNAP:
+    def test_topdown(self):
+        """
+        Verifies that the generated supernodes contain the correct number of
+        supernodes and correct subsets of nodes in those supernodes
+        """
+        k = 6
+        G = nx.karate_club_graph()
+        node_attributes = ("club",)
+        summary_graph = nx.ksnaptd_aggregation(G, k, node_attributes)
+        assert summary_graph.number_of_nodes() == k
+
+    def test_bottomup(self):
+        """
+        Verifies that the generated supernodes contain the correct subsets of
+        nodes
+        """
+        k = 12
+        G = nx.karate_club_graph()
+        node_attributes = ("club",)
+        summary_graph = nx.ksnapbu_aggregation(G, k, node_attributes)
+        assert summary_graph.number_of_nodes() == k
